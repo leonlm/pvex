@@ -1,0 +1,198 @@
+#!/bin/bash
+
+# Abort if any command returns an error value 
+set -e
+
+# This script is called as the last step of the installation of the 
+# package.  All the package's files are in place, dpkg has already
+# done its automatic conffile handling, and all the packages we depend
+# of are already fully installed and configured.
+
+# The following idempotent stuff doesn't generally need protecting 
+# against being run in the abort-* cases.
+
+# Use debconf. (installs templates)
+. /usr/share/debconf/confmodule
+# all done with debconf here.
+db_stop
+
+case "$1" in
+  triggered)
+    # We don't print a status message here, as dpkg already said
+    # "Processing triggers for ...".
+
+    # test if /etc/pve is mounted; else simple exit to avoid
+    # error during updates
+    test -f /etc/pve/local/pve-ssl.pem || exit 0;
+    test -e /proxmox_install_mode && exit 0;
+
+    # Note: reload-or-try-restart fails if service is not active
+    systemctl --quiet is-active pvedaemon.service && deb-systemd-invoke reload-or-try-restart pvedaemon.service
+    systemctl --quiet is-active pvestatd.service && deb-systemd-invoke reload-or-try-restart pvestatd.service
+    systemctl --quiet is-active pveproxy.service && deb-systemd-invoke reload-or-try-restart pveproxy.service
+    systemctl --quiet is-active spiceproxy.service && deb-systemd-invoke reload-or-try-restart spiceproxy.service
+
+    exit 0;;
+
+  configure)
+    # Configure this package.  If the package must prompt the user for
+    # information, do it here.
+
+    mkdir /etc/pve 2>/dev/null || true
+
+    # remove old APL dir
+    rm -rf /var/lib/pve-manager/apl-available
+
+    # remove old cron.daily update job to randomize it
+    if test -e /etc/cron.daily/pve; then
+	echo "Remove old update script from cron.daily"
+	rm /etc/cron.daily/pve
+    fi
+
+    # remove old/usused init.d files
+    rm -f /etc/init.d/pvebanner
+    rm -f /etc/init.d/pvenetcommit
+    rm -f /etc/init.d/pve-manager
+
+    # create new daily randomize update cronjob if not exist
+    MIN="$(shuf -i 0-59 -n 1)"
+    HOUR="$(shuf -i 2-5 -n 1)"
+    cat <<EOF >/etc/cron.d/pveupdate
+# automatically generated - do not edit
+${MIN} ${HOUR} * * * root /usr/bin/pveupdate
+EOF
+
+    if test ! -e /var/lib/pve-manager/apl-info/download.proxmox.com; then
+	mkdir -p /var/lib/pve-manager/apl-info
+	cp /usr/share/doc/pve-manager/aplinfo.dat /var/lib/pve-manager/apl-info/download.proxmox.com
+	pveam update || true
+    fi
+
+    if test -f /root/.forward; then
+	if ! grep -q '|/usr/bin/pvemailforward' /root/.forward; then 
+	    echo -e "|/usr/bin/pvemailforward\n$(cat /root/.forward)" >/root/.forward.tmp
+	    mv /root/.forward.tmp /root/.forward
+	fi
+    else
+	echo '|/usr/bin/pvemailforward' >/root/.forward
+    fi
+
+    # disable fancy init messages (bad with bootlogd)
+    test -f /etc/lsb-base-logging.sh || echo "FANCYTTY=0" >/etc/lsb-base-logging.sh
+
+    if [ -f /etc/systemd/system/ceph.service ]; then
+	md5=$(md5sum /etc/systemd/system/ceph.service)
+	if [[ "$md5" == "21b2e7a7c4ffcf92ad0ec2c905e88e5b  /etc/systemd/system/ceph.service" ]]; then
+	    echo "Updating PVE ceph.service to correct install target.."
+	    cp /usr/share/doc/pve-manager/examples/ceph.service /etc/systemd/system/ceph.service
+	    systemctl --system daemon-reload >/dev/null || true
+	    systemctl --system disable ceph.service
+	    systemctl --system enable ceph.service
+	    echo " done"
+	fi
+    fi
+
+    systemctl --system daemon-reload >/dev/null || true
+
+    # same as dh_systemd_enable (code copied)
+
+    for timer in pvesr; do
+	deb-systemd-helper unmask $timer.timer >/dev/null || true
+
+	# was-enabled defaults to true, so new installations run enable.
+	if deb-systemd-helper --quiet was-enabled $timer.timer; then
+	    # Enables the unit on first installation, creates new
+	    # symlinks on upgrades if the unit file has changed.
+	    deb-systemd-helper enable $timer.timer >/dev/null || true
+	else
+	    # Update the statefile to add new symlinks (if any), which need to be
+	    # cleaned up on purge. Also remove old symlinks.
+	    deb-systemd-helper update-state $timer.timer >/dev/null || true
+	fi
+    done
+
+    for service in pvedaemon pveproxy spiceproxy pvestatd pvebanner pvenetcommit pve-guests; do
+	deb-systemd-helper unmask $service.service >/dev/null || true
+
+	# was-enabled defaults to true, so new installations run enable.
+	if deb-systemd-helper --quiet was-enabled $service.service; then
+	    # Enables the unit on first installation, creates new
+	    # symlinks on upgrades if the unit file has changed.
+	    deb-systemd-helper enable $service.service >/dev/null || true
+	else
+	    # Update the statefile to add new symlinks (if any), which need to be
+	    # cleaned up on purge. Also remove old symlinks.
+	    deb-systemd-helper update-state $service.service >/dev/null || true
+	fi
+    done
+
+    if test ! -e /proxmox_install_mode; then
+
+	for service in pvedaemon pveproxy spiceproxy pvestatd; do
+	    deb-systemd-invoke reload-or-restart $service
+	done
+
+	deb-systemd-invoke start pvesr.timer >/dev/null || true
+    fi
+
+    # rewrite banner
+    test -e /proxmox_install_mode || pvebanner || true
+
+    #a2ensite pve.conf >/dev/null 2>&1
+
+    # There are three sub-cases:
+    if test "${2+set}" != set; then
+      # We're being installed by an ancient dpkg which doesn't remember
+      # which version was most recently configured, or even whether
+      # there is a most recently configured version.
+      :
+
+    elif test -z "$2" -o "$2" = "<unknown>"; then
+      # The package has not ever been configured on this system, or was
+      # purged since it was last configured.
+      :
+
+    else
+      # Version $2 is the most recently configured version of this
+      # package.
+      if dpkg --compare-versions "$2" '<=' '5.0-23'; then
+        # 5.0-23 temporarily reverted the removal of the startcom CA in
+        # ca-certificates; we've since switched to let's encrypt
+        update-ca-certificates >/dev/null 2>&1
+      fi
+
+    fi ;;
+  abort-upgrade)
+    # Back out of an attempt to upgrade this package FROM THIS VERSION
+    # to version $2.  Undo the effects of "prerm upgrade $2".
+    :
+
+    ;;
+  abort-remove)
+    if test "$2" != in-favour; then
+      echo "$0: undocumented call to \`postinst $*'" 1>&2
+      exit 0
+    fi
+    # Back out of an attempt to remove this package, which was due to
+    # a conflict with package $3 (version $4).  Undo the effects of
+    # "prerm remove in-favour $3 $4".
+    :
+
+    ;;
+  abort-deconfigure)
+    if test "$2" != in-favour -o "$5" != removing; then
+      echo "$0: undocumented call to \`postinst $*'" 1>&2
+      exit 0
+    fi
+    # Back out of an attempt to deconfigure this package, which was
+    # due to package $6 (version $7) which we depend on being removed
+    # to make way for package $3 (version $4).  Undo the effects of
+    # "prerm deconfigure in-favour $3 $4 removing $6 $7".
+    :
+
+    ;;
+  *) echo "$0: didn't understand being called with \`$1'" 1>&2
+     exit 0;;
+esac
+
+exit 0

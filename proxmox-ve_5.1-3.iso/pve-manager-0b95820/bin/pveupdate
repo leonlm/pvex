@@ -1,0 +1,101 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use IO::File;
+use File::Find;
+use File::stat;
+
+use PVE::INotify;
+use PVE::Cluster;
+use PVE::APLInfo;
+use PVE::SafeSyslog;
+use PVE::RPCEnvironment;
+use PVE::API2::Subscription;
+use PVE::API2::APT;
+
+initlog ('pveupdate', 'daemon');
+
+die "please run as root\n" if $> != 0;
+
+$ENV{'PATH'} = '/sbin:/bin:/usr/sbin:/usr/bin';
+
+PVE::INotify::inotify_init();
+
+my $rpcenv = PVE::RPCEnvironment->init('cli');
+
+$rpcenv->init_request();
+$rpcenv->set_language($ENV{LANG});
+$rpcenv->set_user('root@pam');
+
+my $nodename = PVE::INotify::nodename();
+
+eval { PVE::API2::Subscription->update({ node => $nodename }); };
+if (my $err = $@) {
+    syslog ('err', "update subscription info failed: $err");
+}
+
+my $dccfg = PVE::Cluster::cfs_read_file('datacenter.cfg');
+eval { PVE::APLInfo::update($dccfg->{http_proxy}); };
+if (my $err = $@) {
+    syslog ('err', "update appliance info failed - see /var/log/pveam.log for details");
+}
+
+my $info = PVE::INotify::read_file('subscription');
+# We assume that users with subscriptions want informations
+# about new packages.
+my $notify = ($info && $info->{status} eq 'Active') ? 1 : 0;
+eval { PVE::API2::APT->update_database({ node => $nodename, notify => $notify, quiet => 1 }); };
+if (my $err = $@) {
+    syslog ('err', "update apt database failed: $err");
+}
+
+sub cleanup_tasks {
+
+    my $taskdir = "/var/log/pve/tasks";
+    my $filename = "$taskdir/index.1";
+
+    my $fh = IO::File->new($filename, O_RDONLY);
+    return if !$fh;
+
+    my $endtime = 0;
+    while (defined(my $line = <$fh>)) {
+	if ($line =~ m/^(\S+)(\s([0-9A-Za-z]{8})(\s(\S.*))?)?$/) {
+	    $endtime = hex($3);
+	    last;
+	}
+    }
+    close($fh);
+
+    return if !$endtime;
+
+    # print "delete task older that $endtime\n" . localtime($endtime) . "\n";
+
+    my $count = 0;
+
+    my $wanted = sub {
+	my $filename = $_;
+
+	return if $filename !~ m/^UPID:/;
+
+	my $st;
+	if (($st = stat($filename)) && ($st->mtime < $endtime)) {
+	    unlink($filename);
+	    $count++;
+	}
+    };
+
+    foreach my $subdir (qw(0 1 2 3 4 5 6 7 8 9 A B C D E F)) {
+	my $path = "$taskdir/$subdir";
+	find($wanted, $path);
+    }
+
+    if ($count) {
+	syslog('info', "cleanup removed $count task logs");
+    }
+}
+
+cleanup_tasks();
+
+exit (0);

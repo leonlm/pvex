@@ -1,0 +1,21 @@
+[Unit]
+Description=PVE API Proxy Server
+ConditionPathExists=/usr/bin/pveproxy
+Wants=pve-cluster.service
+Wants=pvedaemon.service
+Wants=ssh.service
+Wants=pve-storage.target
+After=pve-storage.target
+After=pve-cluster.service
+After=pvedaemon.service
+After=ssh.service
+
+[Service]
+ExecStart=/usr/bin/pveproxy start
+ExecStop=/usr/bin/pveproxy stop
+ExecReload=/usr/bin/pveproxy restart
+PIDFile=/var/run/pveproxy/pveproxy.pid
+Type=forking
+
+[Install]
+WantedBy=multi-user.target

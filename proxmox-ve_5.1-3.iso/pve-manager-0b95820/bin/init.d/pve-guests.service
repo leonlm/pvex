@@ -1,0 +1,29 @@
+[Unit]
+Description=PVE guests
+ConditionPathExists=/usr/bin/pvesh
+RefuseManualStart=true
+RefuseManualStop=true
+Wants=pvestatd.service
+Wants=pveproxy.service
+Wants=spiceproxy.service
+Wants=pve-firewall.service
+Wants=lxc.service
+After=pveproxy.service
+After=pvestatd.service
+After=spiceproxy.service
+After=pve-firewall.service
+After=lxc.service
+After=pve-ha-crm.service pve-ha-lrm.service
+
+[Service]
+Environment="PVE_LOG_ID=pve-guests"
+ExecStart=/usr/bin/pvesh --nooutput create /nodes/localhost/startall
+ExecStop=-/usr/bin/vzdump -stop
+ExecStop=/usr/bin/pvesh --nooutput create /nodes/localhost/stopall
+Type=oneshot
+RemainAfterExit=yes
+TimeoutSec=infinity
+
+[Install]
+WantedBy=multi-user.target
+Alias=pve-manager.service

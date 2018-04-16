@@ -1,0 +1,23 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use PVE::Report;
+
+($> == 0 ) || die "please run as root\n";
+
+print PVE::Report::generate();
+
+__END__
+
+=head1 NAME
+
+pvereport - Proxmox VE Report tool
+
+=head1 SYNOPSIS
+
+pvereport
+
+=head1 DESCRIPTION
+
+Display various information related to a Proxmox VE system
